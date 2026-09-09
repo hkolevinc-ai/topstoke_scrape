@@ -337,7 +337,16 @@ def local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
-def discover_product_urls(config: Config) -> list[str]:
+def product_urls_from_sitemap(source: str) -> list[str]:
+    root = ET.fromstring(source)
+    product_urls: list[str] = []
+    for child in root.iter():
+        if local_name(child.tag) == "loc" and child.text and "/product/" in child.text:
+            product_urls.append(child.text.strip())
+    return list(dict.fromkeys(product_urls))
+
+
+def discover_from_root_sitemap(config: Config, max_urls: int = 0) -> list[str]:
     root = ET.fromstring(get_text(config.root_sitemap, config.request_timeout))
     sitemap_urls = [
         child.text.strip()
@@ -347,14 +356,99 @@ def discover_product_urls(config: Config) -> list[str]:
     product_urls: list[str] = []
     for sitemap_url in sitemap_urls:
         logging.info("Reading product sitemap: %s", sitemap_url)
-        xml_root = ET.fromstring(get_text(sitemap_url, config.request_timeout))
-        for url_node in list(xml_root):
-            if local_name(url_node.tag) != "url":
-                continue
-            loc = next((n.text for n in url_node if local_name(n.tag) == "loc" and n.text), None)
-            if loc and "/product/" in loc:
-                product_urls.append(loc.strip())
-    return sorted(dict.fromkeys(product_urls))
+        product_urls.extend(product_urls_from_sitemap(get_text(sitemap_url, config.request_timeout)))
+        if max_urls and len(product_urls) >= max_urls:
+            break
+    return list(dict.fromkeys(product_urls))
+
+
+def discover_from_direct_sitemaps(config: Config, max_urls: int = 0) -> list[str]:
+    """Try CloudCart's predictable product sitemap URLs without reading the index."""
+    product_urls: list[str] = []
+    for index in range(1, 51):
+        sitemap_url = urljoin(config.site_url, f"/sitemap/product/{index}.xml")
+        try:
+            logging.info("Trying direct product sitemap: %s", sitemap_url)
+            batch = product_urls_from_sitemap(get_text(sitemap_url, config.request_timeout))
+        except Exception as exc:
+            if index == 1:
+                logging.warning("Direct product sitemaps are unavailable: %s", exc)
+            break
+        if not batch:
+            break
+        product_urls.extend(batch)
+        if max_urls and len(product_urls) >= max_urls:
+            break
+        # CloudCart currently writes at most 1,000 products per sitemap.
+        if len(batch) < 1000:
+            break
+    return list(dict.fromkeys(product_urls))
+
+
+def extract_catalogue_links(source: str, base_url: str) -> tuple[list[str], int]:
+    products: list[str] = []
+    for raw_href in re.findall(r"\bhref\s*=\s*['\"]([^'\"]+)", source, flags=re.IGNORECASE):
+        absolute = urljoin(base_url, html.unescape(raw_href))
+        parts = urlsplit(absolute)
+        if parts.netloc.lower() == urlsplit(base_url).netloc.lower() and parts.path.startswith("/product/"):
+            products.append(urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", "")))
+    page_counts = [int(value) for value in re.findall(r"data-pages=['\"](\d+)", source, flags=re.IGNORECASE)]
+    return list(dict.fromkeys(products)), max(page_counts, default=1)
+
+
+def discover_from_catalogue(config: Config, max_urls: int = 0) -> list[str]:
+    """Fallback for hosts that block XML sitemap requests from GitHub runners."""
+    catalogue_url = urljoin(config.site_url, "/category/produkti")
+    logging.info("Using catalogue fallback: %s", catalogue_url)
+    first_source = get_text(catalogue_url, config.request_timeout)
+    product_urls, page_count = extract_catalogue_links(first_source, catalogue_url)
+    if max_urls and len(product_urls) >= max_urls:
+        return product_urls[:max_urls]
+
+    pages = list(range(2, page_count + 1))
+    if max_urls and product_urls:
+        products_per_page = len(product_urls)
+        required_pages = max(1, (max_urls + products_per_page - 1) // products_per_page)
+        pages = pages[: max(0, required_pages - 1)]
+
+    def fetch_page(page_number: int) -> tuple[int, list[str]]:
+        page_url = f"{catalogue_url}?page={page_number}"
+        source = get_text(page_url, config.request_timeout)
+        links, _ = extract_catalogue_links(source, page_url)
+        return page_number, links
+
+    page_results: dict[int, list[str]] = {}
+    with ThreadPoolExecutor(max_workers=config.workers) as executor:
+        future_to_page = {executor.submit(fetch_page, page): page for page in pages}
+        for future in as_completed(future_to_page):
+            page = future_to_page[future]
+            try:
+                page_number, links = future.result()
+                page_results[page_number] = links
+                logging.info("Catalogue discovery page %d/%d", page_number, page_count)
+            except Exception as exc:
+                logging.warning("Catalogue page %d failed: %s", page, exc)
+    for page in sorted(page_results):
+        product_urls.extend(page_results[page])
+    return list(dict.fromkeys(product_urls))[: max_urls or None]
+
+
+def discover_product_urls(config: Config, max_urls: int = 0) -> list[str]:
+    try:
+        urls = discover_from_root_sitemap(config, max_urls)
+        if urls:
+            return urls[: max_urls or None]
+    except Exception as exc:
+        logging.warning("Root sitemap is unavailable; switching discovery method: %s", exc)
+
+    urls = discover_from_direct_sitemaps(config, max_urls)
+    if urls:
+        return urls[: max_urls or None]
+
+    urls = discover_from_catalogue(config, max_urls)
+    if not urls:
+        raise RuntimeError("No product URLs could be discovered from sitemap or catalogue")
+    return urls
 
 
 def normalize_space(value: str) -> str:
@@ -589,10 +683,10 @@ def classify_kind(product: Product) -> str | None:
         return "short_set"
     if re.search(r"дълг(?:и|) екип|далг[- ]?екип|long set", text):
         return "long_set"
-    if re.search(r"долнищ|dolnish|пантал", text):
-        return None
     if re.search(r"шорт|shorti|shorts", text):
         return "shorts"
+    if re.search(r"долнищ|dolnish|пантал", text):
+        return None
     if re.search(r"ветров|vetrov|windbreak", text):
         return "windbreaker"
     if re.search(r"суичър без ръкав|suichar-bez-rakavi|елек|elek|\bvest\b", text):
@@ -978,8 +1072,8 @@ def main() -> int:
         logging.error("Template file not found: %s", args.template)
         return 2
 
-    urls = list(dict.fromkeys(args.start_url)) if args.start_url else discover_product_urls(config)
     limit = args.max_products or (15 if args.mode == "test" else 0)
+    urls = list(dict.fromkeys(args.start_url)) if args.start_url else discover_product_urls(config, limit)
     if limit:
         urls = urls[:limit]
     logging.info("Products selected: %d", len(urls))

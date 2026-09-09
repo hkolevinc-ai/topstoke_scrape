@@ -1,6 +1,8 @@
 # TopStokee → Temu scraper
 
-The scraper scans all product sitemaps on `topstokee.com`, reads the CloudCart product data, and populates the supplied Temu template.
+Version 1.1 adds automatic HTTP 403 recovery for GitHub Actions and correctly prioritizes sale shorts even when their source breadcrumb is "Bottoms".
+
+The scraper scans all products on `topstokee.com`, reads the CloudCart product data, and populates the supplied Temu template. Product discovery automatically falls back from the sitemap index to direct product sitemaps and then to the complete product catalogue when a GitHub runner receives HTTP 403.
 
 ## What it does
 
