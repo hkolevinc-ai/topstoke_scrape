@@ -17,9 +17,9 @@ on:
         default: "0"
         type: string
       workers:
-        description: "Parallel requests"
+        description: "Parallel requests; 3 is safer for this site"
         required: true
-        default: "8"
+        default: "3"
         type: string
 
 jobs:
