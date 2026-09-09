@@ -1,0 +1,26 @@
+{
+  "default_quantity": 10,
+  "max_rows_per_file": 1900,
+  "workers": 8,
+  "request_timeout": 45,
+  "request_delay_seconds": 0.12,
+  "shipping_template": "OFIS",
+  "manufacturer": "TOP STOKE EOOD",
+  "eu_responsible_person": "",
+  "country_of_origin": "Bulgaria",
+  "default_color": "Multicolor",
+  "default_composition": {
+    "tshirt": {"Cotton": 100.0},
+    "hoodie": {"Cotton": 80.0, "Polyester": 20.0},
+    "sweatshirt": {"Cotton": 80.0, "Polyester": 20.0},
+    "tank": {"Cotton": 100.0},
+    "vest": {"Cotton": 80.0, "Polyester": 20.0},
+    "windbreaker": {"Polyester": 100.0},
+    "shorts": {"Cotton": 80.0, "Polyester": 20.0},
+    "short_set": {"Cotton": 80.0, "Polyester": 20.0},
+    "long_set": {"Cotton": 80.0, "Polyester": 20.0},
+    "set": {"Cotton": 80.0, "Polyester": 20.0},
+    "hat": {"Polyester": 100.0},
+    "polo": {"Cotton": 100.0}
+  }
+}
