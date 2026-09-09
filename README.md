@@ -1,6 +1,6 @@
 # TopStokee → Temu scraper
 
-Version 1.1 adds automatic HTTP 403 recovery for GitHub Actions and correctly prioritizes sale shorts even when their source breadcrumb is "Bottoms".
+Version 1.2 uses browser TLS/HTTP2 impersonation, persistent sessions and a CloudCart AJAX fallback for GitHub Actions HTTP 403 responses. It also correctly prioritizes sale shorts even when their source breadcrumb is "Bottoms".
 
 The scraper scans all products on `topstokee.com`, reads the CloudCart product data, and populates the supplied Temu template. Product discovery automatically falls back from the sitemap index to direct product sitemaps and then to the complete product catalogue when a GitHub runner receives HTTP 403.
 
@@ -19,7 +19,7 @@ The scraper scans all products on `topstokee.com`, reads the CloudCart product d
 
 1. Upload every file and folder from this package to a new GitHub repository. Keep `.github/workflows/scraper.yml` in the same path.
 2. Open **Actions → TopStokee Temu scraper → Run workflow**.
-3. First choose `test`, leave `max_products` at `0`, and run it. Test mode scans 15 products.
+3. First choose `test`, leave `max_products` at `0`, set `workers` to `3`, and run it. Test mode scans 15 products.
 4. Download the `topstokee-temu-results` artifact and test one generated XLSX in Temu.
 5. After the test succeeds, run again with `mode = full` and `max_products = 0`.
 

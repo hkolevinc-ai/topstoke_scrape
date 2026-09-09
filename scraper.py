@@ -8,9 +8,11 @@ import csv
 import html
 import json
 import logging
+import random
 import re
 import shutil
 import sys
+import threading
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
@@ -20,9 +22,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
+from curl_cffi import requests as browser_requests
 from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string
 
@@ -31,6 +32,13 @@ SITE_URL = "https://topstokee.com"
 ROOT_SITEMAP = f"{SITE_URL}/sitemap.xml"
 TEMPLATE_SHEET = "Template"
 FIRST_DATA_ROW = 5
+REQUEST_MIN_INTERVAL_SECONDS = 0.22
+
+_HTTP_STATE = threading.local()
+_RATE_LOCK = threading.Lock()
+_NEXT_REQUEST_AT = 0.0
+_AJAX_NOTICE_LOCK = threading.Lock()
+_AJAX_FALLBACK_NOTICE_SHOWN = False
 
 PROMO_PHRASES = (
     "безплатна доставка над 120лв",
@@ -225,9 +233,9 @@ class Config:
     root_sitemap: str = ROOT_SITEMAP
     default_quantity: int = 10
     max_rows_per_file: int = 1900
-    workers: int = 8
+    workers: int = 3
     request_timeout: int = 45
-    request_delay_seconds: float = 0.12
+    request_delay_seconds: float = 0.35
     shipping_template: str = "OFIS"
     manufacturer: str = "TOP STOKE EOOD"
     eu_responsible_person: str = ""
@@ -305,32 +313,111 @@ class OutputRow:
     age_group: str
 
 
-def get_text(url: str, timeout: int) -> str:
-    request = Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "bg,en;q=0.8",
-            "Cache-Control": "no-cache",
-        },
-    )
+def browser_session() -> Any:
+    session = getattr(_HTTP_STATE, "session", None)
+    if session is None:
+        session = browser_requests.Session(impersonate="chrome")
+        _HTTP_STATE.session = session
+        _HTTP_STATE.warmed_hosts = set()
+    return session
+
+
+def wait_for_request_slot() -> None:
+    global _NEXT_REQUEST_AT
+    with _RATE_LOCK:
+        now = time.monotonic()
+        wait_seconds = max(0.0, _NEXT_REQUEST_AT - now)
+        _NEXT_REQUEST_AT = max(now, _NEXT_REQUEST_AT) + REQUEST_MIN_INTERVAL_SECONDS
+    if wait_seconds:
+        time.sleep(wait_seconds)
+
+
+def unwrap_ajax_body(source: str) -> str:
+    stripped = source.lstrip()
+    if not stripped.startswith("{"):
+        return source
+    try:
+        payload = json.loads(source)
+    except (TypeError, ValueError):
+        return source
+    body = payload.get("body") if isinstance(payload, dict) else None
+    return body if isinstance(body, str) else source
+
+
+def get_text(
+    url: str,
+    timeout: int,
+    *,
+    referer: str = "",
+    ajax: bool = False,
+    retry_forbidden: bool = False,
+) -> str:
+    headers = {
+        "Accept-Language": "bg-BG,bg;q=0.9,en;q=0.7",
+        "Cache-Control": "no-cache",
+    }
+    if referer:
+        headers["Referer"] = referer
+    if ajax:
+        headers.update(
+            {
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "X-Requested-With": "XMLHttpRequest",
+            }
+        )
     last_error: Exception | None = None
     for attempt in range(5):
+        wait_for_request_slot()
         try:
-            with urlopen(request, timeout=timeout) as response:
-                raw = response.read()
-                encoding = response.headers.get_content_charset() or "utf-8"
-                return raw.decode(encoding, errors="replace")
-        except HTTPError as exc:
+            response = browser_session().get(url, headers=headers, timeout=timeout, allow_redirects=True)
+            if 200 <= response.status_code < 300:
+                return unwrap_ajax_body(response.text) if ajax else response.text
+            last_error = RuntimeError(f"HTTP {response.status_code}: {response.reason}")
+            retryable = {429, 500, 502, 503, 504}
+            if retry_forbidden:
+                retryable.add(403)
+            if response.status_code not in retryable:
+                raise last_error
+        except Exception as exc:
             last_error = exc
-            if exc.code not in {429, 500, 502, 503, 504}:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status and status not in {403, 429, 500, 502, 503, 504}:
                 raise
-        except URLError as exc:
-            last_error = exc
-        time.sleep(0.8 * (2 ** attempt))
+        if attempt < 4:
+            time.sleep((0.9 * (2 ** attempt)) + random.uniform(0.15, 0.65))
     assert last_error is not None
     raise last_error
+
+
+def warm_product_session(config: Config) -> None:
+    session = browser_session()
+    host = urlsplit(config.site_url).netloc.lower()
+    warmed_hosts = getattr(_HTTP_STATE, "warmed_hosts", set())
+    if host in warmed_hosts:
+        return
+    try:
+        wait_for_request_slot()
+        response = session.get(
+            config.site_url.rstrip("/") + "/",
+            headers={"Accept-Language": "bg-BG,bg;q=0.9,en;q=0.7"},
+            timeout=config.request_timeout,
+            allow_redirects=True,
+        )
+        if response.status_code >= 400:
+            logging.debug("Session warm-up returned HTTP %s", response.status_code)
+    except Exception as exc:
+        logging.debug("Session warm-up failed: %s", exc)
+    warmed_hosts.add(host)
+    _HTTP_STATE.warmed_hosts = warmed_hosts
+
+
+def log_ajax_fallback_once() -> None:
+    global _AJAX_FALLBACK_NOTICE_SHOWN
+    with _AJAX_NOTICE_LOCK:
+        if _AJAX_FALLBACK_NOTICE_SHOWN:
+            return
+        logging.warning("Regular product pages are blocked; using CloudCart's browser AJAX response")
+        _AJAX_FALLBACK_NOTICE_SHOWN = True
 
 
 def local_name(tag: str) -> str:
@@ -582,7 +669,20 @@ class ProductHTMLExtractor(HTMLParser):
 
 
 def parse_product(url: str, config: Config) -> Product:
-    source = get_text(url, config.request_timeout)
+    warm_product_session(config)
+    referer = urljoin(config.site_url, "/category/produkti")
+    try:
+        source = get_text(url, config.request_timeout, referer=referer)
+    except Exception as regular_error:
+        logging.debug("Regular product request failed for %s: %s", url, regular_error)
+        log_ajax_fallback_once()
+        source = get_text(
+            url,
+            config.request_timeout,
+            referer=referer,
+            ajax=True,
+            retry_forbidden=True,
+        )
     page_data = extract_page_data(source)
     extractor = ProductHTMLExtractor()
     extractor.feed(source)
@@ -596,6 +696,8 @@ def parse_product(url: str, config: Config) -> Product:
     bullets = [clean_description_text(value)[:700] for value in extractor.bullets if clean_description_text(value)][:6]
     if not description:
         description = clean_description_text(extractor.meta_description)
+    if not description:
+        description = clean_description_text(str(page_data.get("name") or ""))
 
     images = [canonical_image_url(page_data.get("image_url", ""))]
     images.extend(canonical_image_url(urljoin(url, raw)) for raw in extractor.main_images)
@@ -1065,9 +1167,16 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     config = Config.from_json(args.config)
+    requested_workers = args.workers or config.workers
     if args.workers > 0:
-        config.workers = args.workers
+        config.workers = max(1, min(args.workers, 3))
     configure_logging(args.output_dir)
+    if requested_workers != config.workers:
+        logging.warning(
+            "Workers reduced from %d to %d to avoid CloudCart rate blocking",
+            requested_workers,
+            config.workers,
+        )
     if not args.template.exists():
         logging.error("Template file not found: %s", args.template)
         return 2
